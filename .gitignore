@@ -1,0 +1,11 @@
+/release
+/build
+/.tmp
+/tools
+/reference
+*sh
+*elf
+*lst
+*nacp
+*nro
+*apk

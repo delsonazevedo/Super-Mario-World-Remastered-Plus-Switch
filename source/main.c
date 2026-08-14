@@ -26,6 +26,7 @@
 #include "jni_fake.h"
 #include "patch.h"
 #include "libc_shim.h"
+#include "hotfix.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -600,6 +601,7 @@ int main(void) {
   resolve_data_root(); // adopt the actual launch folder as the data root
   stats_open();
   check_data();
+  apply_asset_hotfixes(); // restore game data files known to be missing from the APK export
   mkdir(config.save_root, 0777);
   {
     char cache[300];

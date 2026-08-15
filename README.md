@@ -1,4 +1,4 @@
-<div align="center"><img src="extras/logo.png"></img></div>
+<div align="center"><img src="./extras/Logo.png"></img></div>
 <h1 align="center">Super Mario World Remastered Plus · Nintendo Switch port</h1>
 
 A wrapper/loader that runs the **Android release of Super Mario World

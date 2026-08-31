@@ -28,6 +28,24 @@ forwarder, so the port runs with full RAM. It will not work in applet/album mode
 
 Saves and `config.txt` live in `/switch/smwr_nx/save/`.
 
+### Multiple players
+
+Up to four controllers are read separately, so the game's co-op works. Each pad
+is announced to the engine as its own device, hot-plugged and hot-removed while
+the game runs. Pro Controllers, Joy-Con pairs and lone sideways Joy-Cons are all
+detected from the npad style, and the Joy-Cons attached to the console take the
+first player slot nobody else is using.
+
+Three optional `config.txt` keys:
+
+```
+controller_menu 1   # 0 = never show the system controller-assignment applet,
+                    # 1..4 = show it asking for at least that many players
+split_joycons 0     # 1 = force every Joy-Con pair to split into two players
+joycon_turn 3       # quarter turns clockwise applied to a lone left Joy-Con
+                    # (0..3); the right one gets the mirror of this
+```
+
 ### How to build
 
 You need devkitA64 (devkitPro) with these packages:

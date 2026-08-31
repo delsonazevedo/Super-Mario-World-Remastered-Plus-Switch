@@ -19,7 +19,10 @@
 #define CONFIG_VARS \
   CONFIG_VAR_INT(screen_width); \
   CONFIG_VAR_INT(screen_height); \
-  CONFIG_VAR_INT(boost);
+  CONFIG_VAR_INT(boost); \
+  CONFIG_VAR_INT(split_joycons); \
+  CONFIG_VAR_INT(joycon_turn); \
+  CONFIG_VAR_INT(controller_menu);
 
 Config config;
 
@@ -41,6 +44,7 @@ int read_config(const char *file) {
   memset(&config, 0, sizeof(Config));
   config.screen_width = -1; // auto
   config.screen_height = -1;
+  config.joycon_turn = 3;
   strlcpy(config.data_root, DEFAULT_DATA_ROOT, sizeof(config.data_root));
   strlcpy(config.save_root, DEFAULT_SAVE_ROOT, sizeof(config.save_root));
 

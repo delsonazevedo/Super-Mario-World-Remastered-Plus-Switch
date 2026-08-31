@@ -38,6 +38,10 @@ typedef struct {
   int screen_width;   // -1 = auto (1080p docked / 720p handheld)
   int screen_height;
   int boost;          // 0 = adaptive CPU boost (default); 1 = always boosted
+  int split_joycons;  // 1 = each half of a Joy-Con pair becomes its own player
+  int joycon_turn;   // quarter turns clockwise for a lone left Joy-Con (0..3)
+  int controller_menu; // 0 = off; 1..4 = show the system controller-assignment
+                       // screen at boot, asking for at least that many players
   char data_root[256];
   char save_root[256];
 } Config;

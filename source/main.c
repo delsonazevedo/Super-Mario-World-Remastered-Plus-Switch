@@ -260,13 +260,25 @@ static void resolve_entry_points(void) {
 #define GD_AXIS_LT 4
 #define GD_AXIS_RT 5
 
-static PadState pad;
+// Up to four separate players. padInitializeAny() used to merge every attached
+// controller into a single PadState, which is why the game saw four Joy-Cons as
+// one shared player 1. Each pad is now its own npad and its own Godot device id.
+#define MAX_PLAYERS 4
+
+static PadState pads[MAX_PLAYERS];
+// The console's own Joy-Cons are a separate npad (Handheld). Folding it into
+// player 1's mask made the attached pair and the first wireless pair land on
+// the same player, so it gets its own state and only stands in for player 1
+// when no wireless controller has claimed that slot.
+static PadState pad_handheld;
 
 // label mapping (Switch A -> Godot A, ...): with the game's ui_accept on
 // Godot A and ui_back on Godot B this gives standard Switch menu behavior
 // (A confirms, B backs out). Gameplay actions are tuned via the redirected
 // input .tres resources in assets/smwr_inputs/ (jump=B, spin=A, run=X/Y).
-static struct { u64 sw; int btn; } s_btnmap[] = {
+typedef struct { u64 sw; int btn; } BtnMap;
+
+static BtnMap s_btnmap[] = {
   { HidNpadButton_A,      GD_JOY_A },        // east
   { HidNpadButton_B,      GD_JOY_B },        // south
   { HidNpadButton_X,      GD_JOY_X },        // north
@@ -283,9 +295,65 @@ static struct { u64 sw; int btn; } s_btnmap[] = {
   { HidNpadButton_Right,  GD_JOY_DPAD_RIGHT },
 };
 
-static u64 s_prev_buttons = 0;
+// A lone Joy-Con is held sideways, so everything it reports is a quarter turn
+// off and we rotate it here: the console does not do it for us.
+//
+// The four buttons under the thumb, listed clockwise from the one at the top as
+// the Joy-Con itself sees them. The rotation below turns this list into screen
+// positions, so getting the turn right fixes the stick and the buttons at once.
+static const u64 s_joyleft_dirs[4]  = {                      // left: the d-pad
+  HidNpadButton_Up, HidNpadButton_Right, HidNpadButton_Down, HidNpadButton_Left,
+};
+static const u64 s_joyright_dirs[4] = {                      // right: A/B/X/Y
+  HidNpadButton_X, HidNpadButton_A, HidNpadButton_B, HidNpadButton_Y,
+};
+// Screen positions in the same clockwise order, using the game's own labels.
+static const int s_screen_dirs[4] = { GD_JOY_X, GD_JOY_A, GD_JOY_B, GD_JOY_Y };
+
+// Quarter turns clockwise applied to a left Joy-Con; the right one is held the
+// other way round, so it gets the mirror. Overridable from config.txt because
+// this is the one thing that cannot be checked without the hardware in hand.
+#define JOYCON_TURN_DEFAULT 3
+
+static int joycon_turns(int is_right) {
+  int t = config.joycon_turn;
+  if (t < 0 || t > 3) t = JOYCON_TURN_DEFAULT;
+  return is_right ? ((4 - t) & 3) : t;
+}
+
+// Rotate a stick reading by that many quarter turns clockwise.
+static void rotate_stick(int turns, float *x, float *y) {
+  float ox = *x, oy = *y;
+  switch (turns & 3) {
+    case 1: *x =  oy; *y = -ox; break;
+    case 2: *x = -ox; *y = -oy; break;
+    case 3: *x = -oy; *y =  ox; break;
+    default: break;
+  }
+}
+
+// Built per pad, so left and right Joy-Cons can use different turns.
+static BtnMap s_btnmap_single[7];
+
+static unsigned build_single_map(int is_right) {
+  const u64 *dirs = is_right ? s_joyright_dirs : s_joyleft_dirs;
+  const int t = joycon_turns(is_right);
+  for (int i = 0; i < 4; i++) {
+    s_btnmap_single[i].sw  = dirs[i];
+    s_btnmap_single[i].btn = s_screen_dirs[(i + t) & 3];
+  }
+  s_btnmap_single[4] = (BtnMap){ is_right ? HidNpadButton_RightSL : HidNpadButton_LeftSL, GD_JOY_L1 };
+  s_btnmap_single[5] = (BtnMap){ is_right ? HidNpadButton_RightSR : HidNpadButton_LeftSR, GD_JOY_R1 };
+  s_btnmap_single[6] = (BtnMap){ is_right ? HidNpadButton_Plus    : HidNpadButton_Minus,  GD_JOY_START };
+  return 7;
+}
+
+#define BTNMAP_N(m) (sizeof(m) / sizeof(*(m)))
+
+static u64 s_prev_buttons[MAX_PLAYERS];
 static int s_touching = 0;
-static float s_prev_axis[6] = { 99, 99, 99, 99, 99, 99 }; // force initial send
+static float s_prev_axis[MAX_PLAYERS][6]; // seeded to 99 so the first value always sends
+static int s_pad_connected[MAX_PLAYERS];  // -1 until the first poll, so it always announces
 
 static float stick_norm(s32 v) {
   float f = v / 32767.0f;
@@ -294,37 +362,103 @@ static float stick_norm(s32 v) {
   return f;
 }
 
-static void send_axis(void *cls, int axis, float v) {
-  if (v == s_prev_axis[axis]) return;
-  s_prev_axis[axis] = v;
-  if (e_joyaxis) e_joyaxis(fake_env, cls, 0, axis, v);
+static void send_axis(void *cls, int player, int axis, float v) {
+  if (v == s_prev_axis[player][axis]) return;
+  s_prev_axis[player][axis] = v;
+  if (e_joyaxis) e_joyaxis(fake_env, cls, player, axis, v);
+}
+
+// Tell the engine a pad appeared or went away. Godot keys its joypads by the
+// device id, so player N is simply device N.
+static void announce_pad(void *cls, int player, int connected) {
+  if (!e_joyconnectionchanged) return;
+  void *name = jni_new_string("Nintendo Switch Controller");
+  e_joyconnectionchanged(fake_env, cls, player, connected ? 1 : 0, name);
+  jni_release_local(name);
 }
 
 static void poll_input(void) {
   void *cls = jni_activity_class();
-  padUpdate(&pad);
-  const u64 cur = padGetButtons(&pad);
 
-  if (e_joybutton) {
-    for (unsigned i = 0; i < sizeof(s_btnmap) / sizeof(*s_btnmap); i++) {
-      const u64 m = s_btnmap[i].sw;
-      if ((cur & m) && !(s_prev_buttons & m))      e_joybutton(fake_env, cls, 0, s_btnmap[i].btn, 1);
-      else if (!(cur & m) && (s_prev_buttons & m)) e_joybutton(fake_env, cls, 0, s_btnmap[i].btn, 0);
+  // The Joy-Cons attached to the console are their own npad and never occupy a
+  // wireless slot, so give them the first player slot nobody else is using.
+  // Alone that makes them player 1; with three wireless pads already in, they
+  // become player 4.
+  padUpdate(&pad_handheld);
+  int handheld_slot = -1;
+  if (padIsConnected(&pad_handheld)) {
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+      padUpdate(&pads[p]);
+      if (!padIsConnected(&pads[p])) { handheld_slot = p; break; }
     }
   }
 
-  // sticks: godot's android convention is Y-down-positive
-  HidAnalogStickState l = padGetStickPos(&pad, 0);
-  HidAnalogStickState r = padGetStickPos(&pad, 1);
-  send_axis(cls, GD_AXIS_LX, stick_norm(l.x));
-  send_axis(cls, GD_AXIS_LY, -stick_norm(l.y));
-  send_axis(cls, GD_AXIS_RX, stick_norm(r.x));
-  send_axis(cls, GD_AXIS_RY, -stick_norm(r.y));
-  // ZL/ZR as digital triggers
-  send_axis(cls, GD_AXIS_LT, (cur & HidNpadButton_ZL) ? 1.0f : 0.0f);
-  send_axis(cls, GD_AXIS_RT, (cur & HidNpadButton_ZR) ? 1.0f : 0.0f);
+  for (int p = 0; p < MAX_PLAYERS; p++) {
+    padUpdate(&pads[p]);
 
-  s_prev_buttons = cur;
+    PadState *src = (p == handheld_slot) ? &pad_handheld : &pads[p];
+
+    const int connected = padIsConnected(src) ? 1 : 0;
+    if (connected != s_pad_connected[p]) {
+      s_pad_connected[p] = connected;
+      announce_pad(cls, p, connected);
+      if (!connected) {
+        // release everything this player could be holding, whichever layout it
+        // was using, or the game keeps the buttons pressed forever
+        if (e_joybutton) {
+          for (int b = GD_JOY_A; b <= GD_JOY_DPAD_RIGHT; b++)
+            e_joybutton(fake_env, cls, p, b, 0);
+        }
+        s_prev_buttons[p] = 0;
+        for (int a = 0; a < 6; a++) s_prev_axis[p][a] = 99.0f;
+      }
+      debugPrintf(">> pad %d %s\n", p, connected ? "connected" : "disconnected");
+    }
+    if (!connected) continue;
+
+    const u64 cur = padGetButtons(src);
+
+    // A lone Joy-Con is a different shape of controller, so it gets its own
+    // layout. The system tells us which it is; nothing has to be configured.
+    const u32 style = padGetStyleSet(src);
+    const int joyleft  = (style & HidNpadStyleTag_NpadJoyLeft)  != 0;
+    const int joyright = (style & HidNpadStyleTag_NpadJoyRight) != 0;
+
+    const BtnMap *map = s_btnmap;
+    unsigned nmap = BTNMAP_N(s_btnmap);
+    if (joyleft || joyright) { nmap = build_single_map(joyright); map = s_btnmap_single; }
+
+    if (e_joybutton) {
+      for (unsigned i = 0; i < nmap; i++) {
+        const u64 m = map[i].sw;
+        if ((cur & m) && !(s_prev_buttons[p] & m))      e_joybutton(fake_env, cls, p, map[i].btn, 1);
+        else if (!(cur & m) && (s_prev_buttons[p] & m)) e_joybutton(fake_env, cls, p, map[i].btn, 0);
+      }
+    }
+
+    // sticks: godot's android convention is Y-down-positive
+    HidAnalogStickState l = padGetStickPos(src, 0);
+    HidAnalogStickState r = padGetStickPos(src, 1);
+    if (joyleft || joyright) {
+      // a lone Joy-Con has one stick; the right one reports it in the right slot
+      HidAnalogStickState s = joyright ? r : l;
+      float sx = stick_norm(s.x), sy = stick_norm(s.y);
+      if (joyright && sx == 0.0f && sy == 0.0f) { sx = stick_norm(l.x); sy = stick_norm(l.y); }
+      rotate_stick(joycon_turns(joyright), &sx, &sy);
+      send_axis(cls, p, GD_AXIS_LX,  sx);
+      send_axis(cls, p, GD_AXIS_LY, -sy);   // godot's android convention is Y-down
+    } else {
+      send_axis(cls, p, GD_AXIS_LX, stick_norm(l.x));
+      send_axis(cls, p, GD_AXIS_LY, -stick_norm(l.y));
+      send_axis(cls, p, GD_AXIS_RX, stick_norm(r.x));
+      send_axis(cls, p, GD_AXIS_RY, -stick_norm(r.y));
+    }
+    // ZL/ZR as digital triggers
+    send_axis(cls, p, GD_AXIS_LT, (cur & HidNpadButton_ZL) ? 1.0f : 0.0f);
+    send_axis(cls, p, GD_AXIS_RT, (cur & HidNpadButton_ZR) ? 1.0f : 0.0f);
+
+    s_prev_buttons[p] = cur;
+  }
 
   // single-finger touch, scaled from the 1280x720 panel to the surface size
   if (e_dispatchTouchEvent) {
@@ -497,14 +631,10 @@ static void game_thread_fn(void *arg) {
     if (frames == 1) stats_mark("step 1 (engine servers up)");
     if (frames == 4) stats_mark("step 4 (game scene running)");
     if (!announced_pad && frames >= 4) {
-      // engine servers are up after the first steps; announce the pad once
-      if (e_joyconnectionchanged) {
-        void *name = jni_new_string("Nintendo Switch Controller");
-        e_joyconnectionchanged(fake_env, cls, 0, 1, name);
-        jni_release_local(name);
-      }
+      // engine servers are up after the first steps; from here poll_input()
+      // announces and drops each pad on its own as players join and leave
       announced_pad = 1;
-      debugPrintf(">> pad announced after %d frames\n", frames);
+      debugPrintf(">> input enabled after %d frames\n", frames);
     }
   }
 
@@ -652,8 +782,50 @@ int main(void) {
   if (chdir(config.save_root) != 0)
     debugPrintf("!! chdir(%s) failed\n", config.save_root);
 
-  padConfigureInput(8, HidNpadStyleSet_NpadStandard);
-  padInitializeAny(&pad);
+  padConfigureInput(MAX_PLAYERS, HidNpadStyleSet_NpadStandard);
+
+  // Ask for raw, unrotated readings: the horizontal hold type did not rotate
+  // anything in practice, and poll_input() now does the quarter turn itself for
+  // lone Joy-Cons. One place doing the rotation, not two.
+  hidSetNpadJoyHoldType(HidNpadJoyHoldType_Vertical);
+
+  // Opt-in: split every Joy-Con pair so each half is its own player. Off by
+  // default, because with it on a player holding a full pair becomes two.
+  if (config.split_joycons) {
+    for (int p = 0; p < MAX_PLAYERS; p++)
+      hidSetNpadJoyAssignmentModeSingleByDefault((HidNpadIdType)(HidNpadIdType_No1 + p));
+  }
+
+  // Ask the system to assign controllers to players, the same screen a retail
+  // multiplayer game shows on boot. Without it the console keeps whatever grip
+  // it already had, and everything lands on player 1.
+  if (config.controller_menu > 0) {
+    int want = config.controller_menu;
+    if (want > MAX_PLAYERS) want = MAX_PLAYERS;
+    HidLaControllerSupportArg arg;
+    hidLaCreateControllerSupportArg(&arg);
+    arg.hdr.player_count_min = (s8)want;
+    arg.hdr.player_count_max = MAX_PLAYERS;
+    arg.hdr.enable_take_over_connection = 1;
+    arg.hdr.enable_permit_joy_dual = 1;
+    // handheld only counts as a player when a single one is enough
+    arg.hdr.enable_single_mode = (want <= 1) ? 1 : 0;
+    HidLaControllerSupportResultInfo info = {0};
+    Result rc = hidLaShowControllerSupport(&info, &arg);
+    debugPrintf(">> controller applet rc=0x%x players=%d\n", (unsigned)rc, (int)info.player_count);
+  }
+
+  // one PadState per player, each tied to its own npad; handheld is separate
+  for (int p = 0; p < MAX_PLAYERS; p++)
+    padInitializeWithMask(&pads[p], 1UL << (HidNpadIdType_No1 + p));
+  padInitializeWithMask(&pad_handheld, 1UL << HidNpadIdType_Handheld);
+
+  for (int p = 0; p < MAX_PLAYERS; p++) {
+    s_pad_connected[p] = -1; // unknown, so the first poll always announces
+    s_prev_buttons[p] = 0;
+    for (int a = 0; a < 6; a++) s_prev_axis[p][a] = 99.0f;
+  }
+
   hidInitializeTouchScreen();
 
   if (R_FAILED(threadCreate(&s_game_thread, game_thread_fn, NULL, NULL, 8 * 1024 * 1024, 0x2C, -2)))
